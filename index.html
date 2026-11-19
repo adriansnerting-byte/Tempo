@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="no">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0b0d10">
+<title>Tempo – tredemølle</title>
+<style>
+  :root { --bg:#0b0d10; --card:#151920; --fg:#f2f4f7; --mut:#8a94a6; --acc:#3ddc97; --warn:#ffb020; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; background:var(--bg); color:var(--fg);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  body { min-height:100vh; display:flex; flex-direction:column; padding:env(safe-area-inset-top) 16px 16px; }
+  header { display:flex; justify-content:space-between; align-items:center; padding:12px 0; }
+  header h1 { font-size:18px; margin:0; font-weight:600; }
+  #status { font-size:13px; color:var(--mut); }
+  #status.ok { color:var(--acc); }
+  #status.err { color:var(--warn); }
+  .pace { text-align:center; margin:12px 0 20px; }
+  .pace .lbl { color:var(--mut); font-size:14px; letter-spacing:.08em; text-transform:uppercase; }
+  .pace .val { font-size:clamp(88px, 28vw, 180px); font-weight:700; line-height:1; font-variant-numeric:tabular-nums; }
+  .pace .unit { color:var(--mut); font-size:18px; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .card { background:var(--card); border-radius:14px; padding:14px; }
+  .card .lbl { color:var(--mut); font-size:12px; text-transform:uppercase; letter-spacing:.06em; }
+  .card .v { font-size:32px; font-weight:600; font-variant-numeric:tabular-nums; margin-top:4px; }
+  .card .u { color:var(--mut); font-size:14px; margin-left:4px; }
+  .btns { display:flex; gap:10px; margin-top:16px; }
+  button { flex:1; font-size:17px; font-weight:600; border:0; border-radius:14px; padding:16px;
+    background:var(--acc); color:#04140c; }
+  button.sec { background:var(--card); color:var(--fg); }
+  button:disabled { opacity:.4; }
+  details { margin-top:16px; color:var(--mut); font-size:12px; }
+  #log { white-space:pre-wrap; font-family:ui-monospace,Menlo,monospace; font-size:11px;
+    max-height:240px; overflow:auto; background:#000; padding:8px; border-radius:8px; }
+  .note { color:var(--mut); font-size:13px; margin-top:12px; line-height:1.4; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Tempo</h1>
+  <span id="status">Ikke tilkoblet</span>
+</header>
+
+<div class="pace">
+  <div class="lbl">Tempo nå</div>
+  <div class="val" id="pace">–:––</div>
+  <div class="unit">min/km</div>
+</div>
+
+<div class="grid">
+  <div class="card"><div class="lbl">Hastighet</div><div class="v"><span id="speed">0.0</span><span class="u">km/t</span></div></div>
+  <div class="card"><div class="lbl">Snittempo</div><div class="v"><span id="avg">–:––</span><span class="u">/km</span></div></div>
+  <div class="card"><div class="lbl">Distanse</div><div class="v"><span id="dist">0.00</span><span class="u">km</span></div></div>
+  <div class="card"><div class="lbl">Tid</div><div class="v"><span id="time">0:00</span></div></div>
+  <div class="card"><div class="lbl">Stigning</div><div class="v"><span id="incl">0.0</span><span class="u">%</span></div></div>
+  <div class="card"><div class="lbl">Puls</div><div class="v"><span id="hr">–</span><span class="u">bpm</span></div></div>
+</div>
+
+<div class="btns">
+  <button id="connect">Koble til mølla</button>
+  <button id="reset" class="sec">Nullstill</button>
+</div>
+
+<p class="note" id="support"></p>
+
+<details>
+  <summary>Feilsøking (rådata)</summary>
+  <div id="log"></div>
+</details>
+
+<script>
+const FTMS = 0x1826, TREADMILL_DATA = 0x2acd;
+const FITSHOW = 0xfff0, FS_NOTIFY = 0xfff1, FS_WRITE = 0xfff2;
+const EXTRA = [0xffe0, 0x180d, 0x180a, 0x180f];
+
+const $ = id => document.getElementById(id);
+const logEl = $('log');
+function log(m){ logEl.textContent = (new Date().toLocaleTimeString()+' '+m+'\n'+logEl.textContent).slice(0,8000); }
+function setStatus(t, cls=''){ $('status').textContent = t; $('status').className = cls; }
+const hex = dv => Array.from(new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength)).map(b=>b.toString(16).padStart(2,'0')).join(' ');
+
+// --- State: we integrate distance/time ourselves as a fallback ---
+let st = { speed:0, distM:null, timeS:null, incl:0, hr:null };
+let own = { distM:0, timeS:0, last:null, running:false };
+
+function fmtPace(kmh){
+  if (!kmh || kmh < 0.5) return '–:––';
+  let s = Math.round(3600 / kmh);
+  return Math.floor(s/60) + ':' + String(s%60).padStart(2,'0');
+}
+function fmtTime(s){
+  s = Math.round(s); const h = Math.floor(s/3600), m = Math.floor(s%3600/60), x = s%60;
+  return (h? h+':'+String(m).padStart(2,'0') : m) + ':' + String(x).padStart(2,'0');
+}
+
+function tick(){
+  const now = performance.now();
+  if (own.last != null && st.speed > 0.5){
+    const dt = (now - own.last)/1000;
+    own.timeS += dt; own.distM += st.speed/3.6*dt;
+  }
+  own.last = now;
+  const distM = st.distM ?? own.distM;
+  const timeS = st.timeS ?? own.timeS;
+  $('pace').textContent = fmtPace(st.speed);
+  $('speed').textContent = st.speed.toFixed(1);
+  $('dist').textContent = (distM/1000).toFixed(2);
+  $('time').textContent = fmtTime(timeS);
+  $('incl').textContent = st.incl.toFixed(1);
+  $('hr').textContent = st.hr ?? '–';
+  $('avg').textContent = (distM > 20 && timeS > 0) ? fmtPace(distM/timeS*3.6) : '–:––';
+}
+setInterval(tick, 500);
+
+$('reset').onclick = () => { own = { distM:0, timeS:0, last:null }; st.distM = null; st.timeS = null; tick(); };
+
+// --- FTMS Treadmill Data (Bluetooth standard) ---
+function parseFTMS(dv){
+  let o = 0; const f = dv.getUint16(o, true); o += 2;
+  if (!(f & 0x0001)) { st.speed = dv.getUint16(o, true)/100; o += 2; }
+  if (f & 0x0002) o += 2;                                    // avg speed
+  if (f & 0x0004) { st.distM = dv.getUint16(o,true) | (dv.getUint8(o+2)<<16); o += 3; }
+  if (f & 0x0008) { st.incl = dv.getInt16(o,true)/10; o += 4; } // incline + ramp angle
+  if (f & 0x0010) o += 4;                                    // elevation gain
+  if (f & 0x0020) o += 1;                                    // inst pace
+  if (f & 0x0040) o += 1;                                    // avg pace
+  if (f & 0x0080) o += 5;                                    // energy
+  if (f & 0x0100) { const h = dv.getUint8(o); st.hr = h || null; o += 1; }
+  if (f & 0x0200) o += 1;                                    // MET
+  if (f & 0x0400) { st.timeS = dv.getUint16(o,true); o += 2; }
+}
+
+// --- FitShow proprietary protocol (experimental fallback) ---
+function fsFrame(bytes){ let c = 0; bytes.forEach(b => c ^= b); return new Uint8Array([0x02, ...bytes, c, 0x03]); }
+function parseFitShow(dv){
+  const b = new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
+  if (b[0] !== 0x02 || b[1] !== 0x51 || b.length < 12) return;
+  const status = b[2];
+  if (status === 0x03) {           // running
+    st.speed = b[3]/10; st.incl = (b[4] > 127 ? b[4]-256 : b[4]);
+    st.timeS = b[5] | (b[6]<<8);
+    st.distM = b[7] | (b[8]<<8);
+  } else { st.speed = 0; }
+}
+
+async function connect(){
+  try {
+    setStatus('Søker…');
+    const dev = await navigator.bluetooth.requestDevice({
+      acceptAllDevices: true,
+      optionalServices: [FTMS, FITSHOW, ...EXTRA]
+    });
+    log('Valgt: ' + (dev.name || dev.id));
+    dev.addEventListener('gattserverdisconnected', () => { setStatus('Frakoblet', 'err'); st.speed = 0; log('Frakoblet'); });
+    setStatus('Kobler til…');
+    const srv = await dev.gatt.connect();
+    const services = await srv.getPrimaryServices();
+    log('Tjenester: ' + services.map(s => s.uuid.slice(4,8)).join(', '));
+
+    const ftms = services.find(s => s.uuid.startsWith('00001826'));
+    if (ftms) {
+      const ch = await ftms.getCharacteristic(TREADMILL_DATA);
+      ch.addEventListener('characteristicvaluechanged', e => { const v = e.target.value; log('FTMS ' + hex(v)); parseFTMS(v); });
+      await ch.startNotifications();
+      setStatus('Tilkoblet (FTMS) – ' + (dev.name||''), 'ok');
+      requestWakeLock(); return;
+    }
+
+    const fs = services.find(s => s.uuid.startsWith('0000fff0'));
+    if (fs) {
+      const n = await fs.getCharacteristic(FS_NOTIFY);
+      const w = await fs.getCharacteristic(FS_WRITE);
+      n.addEventListener('characteristicvaluechanged', e => { const v = e.target.value; log('FS ' + hex(v)); parseFitShow(v); });
+      await n.startNotifications();
+      setInterval(() => w.writeValueWithoutResponse ? w.writeValueWithoutResponse(fsFrame([0x51])) : w.writeValue(fsFrame([0x51])), 1000);
+      setStatus('Tilkoblet (FitShow) – ' + (dev.name||''), 'ok');
+      requestWakeLock(); return;
+    }
+
+    // Unknown: subscribe to everything that notifies, so we can see raw data
+    for (const s of services) {
+      for (const c of await s.getCharacteristics()) {
+        log(`  ${s.uuid.slice(4,8)}/${c.uuid.slice(4,8)} ${c.properties.notify?'notify ':''}${c.properties.write?'write':''}`);
+        if (c.properties.notify) {
+          c.addEventListener('characteristicvaluechanged', e => log(c.uuid.slice(4,8) + ' ' + hex(e.target.value)));
+          await c.startNotifications();
+        }
+      }
+    }
+    setStatus('Ukjent protokoll – se rådata', 'err');
+  } catch (e) {
+    setStatus('Feil: ' + e.message, 'err'); log('Feil: ' + e);
+  }
+}
+$('connect').onclick = connect;
+
+let wl = null;
+async function requestWakeLock(){ try { wl = await navigator.wakeLock?.request('screen'); } catch(e){} }
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && wl) requestWakeLock(); });
+
+if (!navigator.bluetooth) {
+  $('connect').disabled = true;
+  $('support').innerHTML = 'Denne nettleseren støtter ikke Bluetooth. På iPhone: bruk appen <b>Bluefy</b> (gratis). På Android/PC: bruk <b>Chrome</b>.';
+} else if (!window.isSecureContext) {
+  $('support').textContent = 'Siden må åpnes via https for at Bluetooth skal virke.';
+}
+</script>
+</body>
+</html>
